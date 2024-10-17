@@ -207,6 +207,45 @@ max(diag_C$Rhat)     # 1.007272 - it will do
 
 ```
 
+```{r}
+#| label: stan_no_fixed_eff
+#| echo: false
+
+ad <- 0.99
+mt <- 12
+it <- 1000
+
+# --- Run Stan model to get draws parameters
+# Call the rstan package
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# time_start <- Sys.time()
+stanfit_nf <- stan(file = "flow_norm_randomeff.stan", # Stan model for Occurrence Model
+                data = stan_data,
+                control = list(adapt_delta = ad, max_treedepth = mt),
+                #control = list(adapt_delta = 0.99, max_treedepth = 14),
+                iter = it,
+                chains = 4, 
+                seed = proj_seed,
+                verbose = F) 
+  # 255.748 seconds
+
+check_energy(stanfit_nf) #  0.7844560 0.8553087 0.8657838 0.8861246 All above 0.03 - good!
+draws_nf <- rstan::extract(stanfit_nf, inc_warmup = FALSE) # Extract the draws parameters
+saveRDS(draws_nf, "draws/C_draws_nf.RData")
+  
+diag_C <- as.data.frame(monitor(stanfit_nf, warmup = 0, print = FALSE))
+diag_C_ESS <- diag_C[c("mean", "sd", "2.5%", "97.5%", "n_eff", "Bulk_ESS", "Tail_ESS", "Rhat")]
+  
+min(diag_C$Bulk_ESS) # 911 - good!
+min(diag_C$Tail_ESS) # 1266 - good!
+min(na.omit(diag_C$n_eff))    # 1177 - good!
+max(diag_C$Rhat)     # 1.007272 - it will do
+
+
+```
+
 ### 2.3. Model evaluation
 
 I have evaluated the predictive accuracy of the model by comparing the coefficient of determination ($R^2$), and coefficients for intercept and slope; an intercept equal to 0 and regression slope equal to 1 implies the predicted data predicts observed data with the highest accuracy [@piñeiro2008].
@@ -235,13 +274,14 @@ plot(y = ypred, x = y_obs, title(main = "Bayesian GLM:\ny ~ C + rand. effects", 
 
 # quantile(draws$beta_Q, probs = c(0.025, 0.5, 0.975))
 
-# mean_Q <- mean(draws$beta_Q)
-# mean_int <- mean(draws$intercept)
+c(mean(draws$intercept), mean(draws$beta_Q))
+summary(lm1)
 
 # mean_samp_eff <- round(apply(draws$alpha_samp, 2, FUN = mean), 3)
 # samp_eff <- round(apply(draws$alpha_samp, 2, FUN = quantile, probs = 0.025), 3)
 
-
+summary(lm(y ~ ypred_lm))
+summary(lm(y ~ ypred))
 
 
 ```
@@ -253,8 +293,9 @@ library(loo)
 
 draws <- readRDS(file = "draws/C_draws.RData")
 draws_nr <- readRDS(file = "draws/C_draws_nr.RData")
+draws_nf <- readRDS(file = "draws/C_draws_nf.RData")
 
-loo_compare(list(loo(draws$log_lik), loo(draws_nr$log_lik)))
+loo_compare(list(loo(draws$log_lik), loo(draws_nr$log_lik), loo(draws_nf$log_lik)))
 # Obviously the random effects model is a better fit!
 
 ```
