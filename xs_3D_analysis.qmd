@@ -1,0 +1,260 @@
+---
+title: ""
+format: html
+editor: visual
+bibliography: references.bib
+---
+
+```{r}
+#| label: setup
+
+requiredPackages <- c("tidyverse", "flextable", "rio", "rstan", "loo", "bayesplot")
+for (p in 1:length(requiredPackages)){
+  if(require(requiredPackages[p], character.only = TRUE)){
+    print(paste0(requiredPackages[p], " is loaded correctly"))
+  } else {
+    print(paste0("installing ", requiredPackages[p], "..."))
+    install.packages(paste0(requiredPackages[p]))
+    if(require(requiredPackages[p], character.only = TRUE)){
+      print(paste0(requiredPackages[p], " is installed and loaded"))
+    } else {
+      stop(paste0("could not install ", requiredPackages[p]))
+    }
+  }
+}
+
+proj_seed <- 56024
+set.seed(proj_seed)
+
+# Calc EBFMI:
+check_energy <- function(stanfit){
+  sampler_params <- get_sampler_params(stanfit, inc_warmup=FALSE)
+  EBFMI <- rep(0, times = length(sampler_params))
+  for (n in 1:length(sampler_params)) {
+    energies <- sampler_params[n][[1]][,'energy__']
+    numer <- sum(diff(energies)**2) / length(energies)
+    denom <- var(energies)
+    EBFMI[n] <- numer / denom
+  }
+  return(EBFMI)
+}
+
+# Create folders if they don't exist already:
+system("mkdir -p data")
+system("mkdir -p draws")
+
+```
+
+## 1. Model overview
+
+The following hierarchical mixed-effects Gaussian model was developed within the Bayesian framework of Stan [@gelman2015; @carpenter2017].
+Likelihood was drawn from a Gaussian probability distribution function, expressed by the linear predictor ($\mu_{i}$) composed of fixed and random effects: $$
+y_i \sim Normal(\mu_i, \sigma) \\
+\mu_i = \beta_0 + \beta_1*Q + \alpha_{sample} + \alpha_{position} + \alpha_{habitat} + \alpha_{site}  
+$$
+
+The random effects $\alpha_{sample}$ and $\alpha_{site}$ were specified using a random walk model, treating each subsequent downstream site and within-site sample as a random step from the previous without bias [@codling2008].
+
+## 2. Analysis in Stan
+
+Run the setup chunk, then put the file `xs_3D.csv` into the `data/` directory.
+
+### 2.1. Preparing data for Stan
+
+To prepare the data for a hierarchical analysis, I have made the following assumptions:
+
+-   Column `pos`: the entry `downstream_upstream` consists of a mix of upstream and downstream observations, and should be considered its own category.
+
+-   Column `xs_CN`: the value indicates unmeasured distance from the reach center, and the true value depends on whether the point is upstream or downstream.
+    I've coerced this into integers such that the furthermost upstream point (`xs8`) is 1, and the most downstream point is 16 (also `xs8`).
+
+```{r}
+#| label: data_prep
+
+# import data:
+xs_3D <- read.csv(file = "data/xs_3D.csv", header = T)
+
+xs_3D$pos[xs_3D$pos == "downstream_upstream"] <- "mixed"
+xs_3D$xs_CN_us <- xs_3D$xs_CN
+xs_3D$xs_CN_us[xs_3D$pos == "upstream"] <- paste0("us_", xs_3D$xs_CN[xs_3D$pos == "upstream"])
+
+xs_3D$samp_no <- as.integer(as.factor(xs_3D$xs_CN_us))
+xs_3D$samp_no[xs_3D$pos == "upstream"] <- 9 - xs_3D$samp_no[xs_3D$pos == "upstream"]
+
+xs_3D$xs_N <- gsub(" ", "", xs_3D$xs_N)
+xs_3D$site <- stringr::str_extract(xs_3D$out_L, "hx[0-9]+")
+
+samp_no <- xs_3D$samp_no
+
+pos_no <- numeric(nrow(xs_3D))
+pos_no[xs_3D$pos == "upstream"] <- 1
+pos_no[xs_3D$pos == "mixed"] <- 2
+pos_no[xs_3D$pos == "downstream"] <- 3
+
+habitat_no <- as.integer(as.factor(xs_3D$xs_N))
+site_no <- as.integer(as.factor(xs_3D$site))
+
+y <- xs_3D$wd_R
+C <- scale(xs_3D$CA)
+I <- scale(xs_3D$ei)
+
+### assemble into list for Stan:
+
+stan_data <- list(y = y,
+                  C = as.numeric(C),
+                  I = as.numeric(I),
+                  samp_no = samp_no,
+                  pos_no = pos_no,
+                  habitat_no = habitat_no,
+                  site_no = site_no,
+                  n_obs = length(y),
+                  n_samp = max(samp_no),
+                  n_pos = max(pos_no),
+                  n_habitat = max(habitat_no),
+                  n_site = max(site_no)
+                  )
+
+```
+
+### 2.2. Sampling model with Stan
+
+I assessed the model stability and efficiency by inspecting the diagnostic outputs of the model.
+Parameters were tuned to achieve the following conditions, based on recommendations by @vehtari2021:
+
+-   No incidence of divergent transitions
+
+-   All parameter $\hat{R}$ values within 0.99 \< $\hat{R}$ \< 1.01 (convergence implied at $\hat{R}$ = 1)
+
+-   All Bulk and Tail Effective Sample Sizes (ESS) \> 400 (100 per chain)
+
+-   EBFMI \> 0.3 for all chains (close to 1 is ideal)
+
+```{r}
+#| label: stan_all_effects
+#| echo: false
+
+ad <- 0.99
+mt <- 12
+it <- 1000
+
+# --- Run Stan model to get draws parameters
+# Call the rstan package
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# time_start <- Sys.time()
+stanfit <- stan(file = "flow_norm_hierarchical.stan", # Stan model for Occurrence Model
+                data = stan_data,
+                control = list(adapt_delta = ad, max_treedepth = mt),
+                #control = list(adapt_delta = 0.99, max_treedepth = 14),
+                iter = it,
+                chains = 4, 
+                seed = proj_seed,
+                verbose = F) 
+  # 255.748 seconds
+
+check_energy(stanfit) #  0.7844560 0.8553087 0.8657838 0.8861246 All above 0.03 - good!
+draws <- rstan::extract(stanfit, inc_warmup = FALSE) # Extract the draws parameters
+saveRDS(draws, "draws/C_draws.RData")
+  
+diag_C <- as.data.frame(monitor(stanfit, warmup = 0, print = FALSE))
+diag_C_ESS <- diag_C[c("mean", "sd", "2.5%", "97.5%", "n_eff", "Bulk_ESS", "Tail_ESS", "Rhat")]
+  
+min(diag_C$Bulk_ESS) # 911 - good!
+min(diag_C$Tail_ESS) # 1266 - good!
+min(na.omit(diag_C$n_eff))    # 1177 - good!
+max(diag_C$Rhat)     # 1.007272 - it will do
+
+
+```
+
+```{r}
+#| label: stan_no_random_eff
+#| echo: false
+
+ad <- 0.99
+mt <- 12
+it <- 1000
+
+# --- Run Stan model to get draws parameters
+# Call the rstan package
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# time_start <- Sys.time()
+stanfit_nr <- stan(file = "flow_norm.stan", # Stan model for Occurrence Model
+                data = stan_data,
+                control = list(adapt_delta = ad, max_treedepth = mt),
+                #control = list(adapt_delta = 0.99, max_treedepth = 14),
+                iter = it,
+                chains = 4, 
+                seed = proj_seed,
+                verbose = F) 
+  # 255.748 seconds
+
+check_energy(stanfit_nr) #  0.7844560 0.8553087 0.8657838 0.8861246 All above 0.03 - good!
+draws <- rstan::extract(stanfit_nr, inc_warmup = FALSE) # Extract the draws parameters
+saveRDS(draws, "draws/C_draws_nr.RData")
+  
+diag_C <- as.data.frame(monitor(stanfit_nr, warmup = 0, print = FALSE))
+diag_C_ESS <- diag_C[c("mean", "sd", "2.5%", "97.5%", "n_eff", "Bulk_ESS", "Tail_ESS", "Rhat")]
+  
+min(diag_C$Bulk_ESS) # 911 - good!
+min(diag_C$Tail_ESS) # 1266 - good!
+min(na.omit(diag_C$n_eff))    # 1177 - good!
+max(diag_C$Rhat)     # 1.007272 - it will do
+
+
+```
+
+### 2.3. Model evaluation
+
+I have evaluated the predictive accuracy of the model by comparing the coefficient of determination ($R^2$), and coefficients for intercept and slope; an intercept equal to 0 and regression slope equal to 1 implies the predicted data predicts observed data with the highest accuracy [@piñeiro2008].
+For Bayesian models, the mean of the posterior predicted observations was used as the predictand.
+
+```{r}
+#| label: fig-P_vs_O
+#| fig-height: 6
+#| fig-width: 6
+
+# y <- xs_3D$wd_R
+# C <- scale(xs_3D$CA)
+# I <- scale(xs_3D$ei)
+
+ypred <- apply(draws$y_pred, 2, FUN = mean)
+ypred_nr <- apply(draws_nr$y_pred, 2, FUN = mean)
+y_obs <- xs_3D$wd_R
+
+lm1 <- lm(y ~ C)
+ypred_lm <- predict(lm1)
+
+par(mfrow = c(2, 2))
+plot(y = ypred_lm, x = y_obs, title(main = "Linear Regression:\ny ~ C", adj = 0))
+plot(y = ypred_nr, x = y_obs, title(main = "Bayesian GLM:\ny ~ C", adj = 0))
+plot(y = ypred, x = y_obs, title(main = "Bayesian GLM:\ny ~ C + rand. effects", adj = 0))
+
+# quantile(draws$beta_Q, probs = c(0.025, 0.5, 0.975))
+
+# mean_Q <- mean(draws$beta_Q)
+# mean_int <- mean(draws$intercept)
+
+# mean_samp_eff <- round(apply(draws$alpha_samp, 2, FUN = mean), 3)
+# samp_eff <- round(apply(draws$alpha_samp, 2, FUN = quantile, probs = 0.025), 3)
+
+
+
+
+```
+
+```{r}
+#| label: looic
+
+library(loo)
+
+draws <- readRDS(file = "draws/C_draws.RData")
+draws_nr <- readRDS(file = "draws/C_draws_nr.RData")
+
+loo_compare(list(loo(draws$log_lik), loo(draws_nr$log_lik)))
+# Obviously the random effects model is a better fit!
+
+```
